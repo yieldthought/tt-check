@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tt-check"
-version = "0.1.0"
+version = "0.1.1"
 description = "Small TTNN readiness check for Tenstorrent systems"
 readme = "README.md"
 requires-python = ">=3.10,<3.13,!=3.11.*"
@@ -28,6 +28,7 @@ dependencies = [
   "torch; platform_system == 'Linux'",
   "tt-smi>=3.1.1; platform_system == 'Linux'",
   "ttnn; platform_system == 'Linux'",
+  "tqdm>=4.66",
 ]
 
 [project.urls]

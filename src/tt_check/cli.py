@@ -8,11 +8,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+PROGRESS_PREFIX = "TT_CHECK_PROGRESS "
 
 
 class CheckError(RuntimeError):
@@ -23,6 +29,14 @@ class CheckError(RuntimeError):
 class CommandResult:
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class TtnnDeviceContext:
+    device: Any
+    tensor_parallel_degree: int
+    is_mesh: bool
+    mesh_shape: tuple[int, int] | None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,12 +58,28 @@ def _main_worker(args: argparse.Namespace) -> int:
         print("ERROR: interrupted", file=sys.stderr)
         return 1
     except Exception as exc:
-        print(f"ERROR: unexpected failure: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"ERROR: unexpected failure: {type(exc).__name__}: {exc}\n\nTraceback:\n{traceback.format_exc()}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
 
+@contextmanager
+def _phase(name: str) -> Iterable[None]:
+    try:
+        yield
+    except CheckError as exc:
+        raise CheckError(f"{name} failed: {exc}") from exc
+    except Exception as exc:
+        raise CheckError(
+            f"{name} failed: {type(exc).__name__}: {exc}\n\nTraceback:\n{traceback.format_exc()}"
+        ) from exc
+
+
 def _main_parent(raw_argv: list[str], args: argparse.Namespace) -> int:
+    start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="tt-check-") as tmp_dir:
         result_path = Path(tmp_dir) / "result.json"
         stdout_path = Path(tmp_dir) / "stdout.txt"
@@ -58,27 +88,44 @@ def _main_parent(raw_argv: list[str], args: argparse.Namespace) -> int:
         env = os.environ.copy()
         env.setdefault("TT_LOGGER_LEVEL", "FATAL")
         env.setdefault("LOGURU_LEVEL", "ERROR")
+        if not args.json:
+            env["TT_CHECK_PROGRESS"] = "1"
 
-        with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
-            "w", encoding="utf-8"
-        ) as stderr_file:
+        with (
+            stdout_path.open("w", encoding="utf-8") as stdout_file,
+            stderr_path.open("w", encoding="utf-8") as stderr_file,
+        ):
+            progress = _ProgressRenderer(enabled=not args.json)
             process = subprocess.Popen(
                 [sys.executable, "-m", "tt_check.cli", *worker_argv],
                 stdout=stdout_file,
-                stderr=stderr_file,
+                stderr=subprocess.PIPE if not args.json else stderr_file,
                 text=True,
                 env=env,
             )
+            stderr_thread = None
+            if process.stderr is not None:
+                stderr_thread = threading.Thread(
+                    target=_drain_worker_stderr,
+                    args=(process.stderr, stderr_file, progress),
+                    daemon=True,
+                )
+                stderr_thread.start()
             try:
-                _wait_with_progress(process, enabled=not args.json)
+                process.wait()
             except KeyboardInterrupt:
                 process.terminate()
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                progress.close()
                 print("ERROR: interrupted", file=sys.stderr)
                 return 1
+            finally:
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=5)
+                progress.close()
 
         stdout = _read_text(stdout_path)
         stderr = _read_text(stderr_path)
@@ -95,6 +142,7 @@ def _main_parent(raw_argv: list[str], args: argparse.Namespace) -> int:
             print(f"ERROR: invalid result JSON: {exc}", file=sys.stderr)
             return 1
 
+    result["elapsed_s"] = time.monotonic() - start
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
@@ -132,20 +180,26 @@ def run_check(args: argparse.Namespace) -> dict[str, Any]:
     _validate_args(args)
     _require_executable("tt-smi")
 
-    reset_result = _run_command(["tt-smi", "-r"], timeout=args.tt_smi_timeout)
-    snapshot = collect_tt_smi_snapshot(timeout=args.tt_smi_timeout)
-    system_info = summarize_system(snapshot)
+    _emit_progress("step_start", label="resetting device")
+    with _phase("resetting device with tt-smi -r"):
+        reset_result = _run_command(["tt-smi", "-r"], timeout=args.tt_smi_timeout)
+    _emit_progress("step_done", label="resetting device")
+    with _phase("detecting system with tt-smi -s"):
+        snapshot = collect_tt_smi_snapshot(timeout=args.tt_smi_timeout)
+        system_info = summarize_system(snapshot)
 
-    mlp_results = run_ttnn_mlp_check(
-        device_id=args.device_id,
-        runs=args.runs,
-        pcc_threshold=args.pcc_threshold,
-        activation_width=args.activation_width_per_device,
-        prefill_rows=args.prefill_rows,
-        decode_rows=args.decode_rows,
-        intermediate_multiplier=args.intermediate_multiplier,
-        seed=args.seed,
-    )
+    with _phase("running TTNN MLP readiness check"):
+        mlp_results = run_ttnn_mlp_check(
+            system_info=system_info,
+            device_id=args.device_id,
+            runs=args.runs,
+            pcc_threshold=args.pcc_threshold,
+            activation_width=args.activation_width_per_device,
+            prefill_rows=args.prefill_rows,
+            decode_rows=args.decode_rows,
+            intermediate_multiplier=args.intermediate_multiplier,
+            seed=args.seed,
+        )
 
     return {
         "status": "pass",
@@ -194,31 +248,117 @@ def _command_output_summary(stdout: str, stderr: str) -> str:
     return f": {combined[-2000:]}"
 
 
-def _wait_with_progress(process: subprocess.Popen[str], *, enabled: bool) -> None:
-    start = time.monotonic()
-    drew_progress = False
-    while process.poll() is None:
-        elapsed = time.monotonic() - start
-        if enabled and sys.stdout.isatty() and elapsed >= 10:
-            drew_progress = True
-            sys.stdout.write(f"\rtt-check {_moving_bar(elapsed)} {elapsed:4.0f}s")
-            sys.stdout.flush()
-        time.sleep(0.2)
-    if drew_progress:
-        sys.stdout.write("\r" + " " * 48 + "\r")
-        sys.stdout.flush()
+class _ProgressRenderer:
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self.current_bar = None
+        self.current_label = ""
+        self.current_step = False
+        self.tqdm = self._load_tqdm() if enabled else None
+
+    def handle(self, event: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        event_type = event.get("event")
+        if event_type == "step_start":
+            self.start_step(str(event.get("label", "work")))
+        elif event_type == "step_done":
+            self.finish_step(str(event.get("status", "ok")))
+        elif event_type == "message":
+            self.write(str(event.get("text", "")))
+        elif event_type == "bar_start":
+            self.start_bar(str(event.get("label", "work")), int(event.get("total", 0)))
+        elif event_type == "bar_update":
+            self.update_bar(int(event.get("advance", 1)))
+        elif event_type == "bar_done":
+            self.finish_bar(str(event.get("label", self.current_label)))
+
+    def start_step(self, label: str) -> None:
+        self.close()
+        self.current_step = True
+        print(f"tt-check: {label}... ", end="", flush=True)
+
+    def finish_step(self, status: str) -> None:
+        if self.current_step:
+            print(status, flush=True)
+            self.current_step = False
+        else:
+            print(f"tt-check: {status}", flush=True)
+
+    def start_bar(self, label: str, total: int) -> None:
+        self.close()
+        self.current_label = label
+        if self.tqdm is None:
+            print(f"tt-check: {label}...", flush=True)
+            return
+        self.current_bar = self.tqdm(
+            total=total,
+            desc=f"tt-check: {label}",
+            unit="run",
+            dynamic_ncols=True,
+            leave=True,
+            file=sys.stdout,
+        )
+
+    def update_bar(self, advance: int) -> None:
+        if self.current_bar is not None:
+            self.current_bar.update(advance)
+
+    def finish_bar(self, label: str) -> None:
+        if self.current_bar is not None:
+            self.current_bar.close()
+            self.current_bar = None
+        elif self.tqdm is None and label:
+            print(f"tt-check: {label} done", flush=True)
+        self.current_label = ""
+
+    def write(self, text: str) -> None:
+        if self.current_step:
+            print(flush=True)
+            self.current_step = False
+        if self.current_bar is not None:
+            self.current_bar.write(f"tt-check: {text}")
+        else:
+            print(f"tt-check: {text}", flush=True)
+
+    def close(self) -> None:
+        if self.current_bar is not None:
+            self.current_bar.close()
+            self.current_bar = None
+        if self.current_step:
+            print("failed", flush=True)
+            self.current_step = False
+
+    @staticmethod
+    def _load_tqdm() -> Any | None:
+        try:
+            from tqdm import tqdm
+        except ModuleNotFoundError:
+            return None
+        return tqdm
 
 
-def _moving_bar(elapsed: float, *, width: int = 24) -> str:
-    position = int(elapsed * 8) % (width * 2)
-    if position >= width:
-        position = width * 2 - position - 1
-    cells = ["-"] * width
-    for offset in range(5):
-        index = position - offset
-        if 0 <= index < width:
-            cells[index] = "#"
-    return "[" + "".join(cells) + "]"
+def _drain_worker_stderr(stderr_pipe: Any, stderr_file: Any, progress: _ProgressRenderer) -> None:
+    for line in iter(stderr_pipe.readline, ""):
+        if line.startswith(PROGRESS_PREFIX):
+            try:
+                progress.handle(json.loads(line[len(PROGRESS_PREFIX) :]))
+            except Exception:
+                stderr_file.write(line)
+                stderr_file.flush()
+        else:
+            stderr_file.write(line)
+            stderr_file.flush()
+
+
+def _emit_progress(event: str, **payload: Any) -> None:
+    if os.environ.get("TT_CHECK_PROGRESS") != "1":
+        return
+    print(
+        PROGRESS_PREFIX + json.dumps({"event": event, **payload}, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _read_text(path: Path) -> str:
@@ -234,9 +374,9 @@ def _format_failure(stdout: str, stderr: str, *, fallback: str = "ERROR: tt-chec
         return fallback
 
     lines = [line.rstrip() for line in combined.splitlines() if line.strip()]
-    error_lines = [line for line in lines if line.startswith("ERROR:")]
-    if error_lines:
-        return error_lines[-1]
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith("ERROR:"):
+            return "\n".join(lines[index:])
 
     tail = "\n".join(lines[-20:])
     return f"{fallback}\n\nLast diagnostics:\n{tail}"
@@ -409,6 +549,7 @@ def _walk_key_values(value: Any, prefix: str = "") -> Iterable[tuple[str, Any]]:
 
 def run_ttnn_mlp_check(
     *,
+    system_info: dict[str, Any] | None = None,
     device_id: int,
     runs: int,
     pcc_threshold: float,
@@ -425,31 +566,83 @@ def run_ttnn_mlp_check(
         raise CheckError(f"missing Python dependency: {exc.name}") from exc
 
     torch.manual_seed(seed)
-    device = None
+    context: TtnnDeviceContext | None = None
     try:
-        device = ttnn.open_device(device_id=device_id, trace_region_size=0)
+        with _phase("opening TTNN device/mesh"):
+            context = _open_ttnn_device_context(ttnn, device_id=device_id)
+        if system_info is not None:
+            _emit_progress("message", text=_format_runtime_system_summary(system_info, context.mesh_shape))
         results = []
         for mode, rows in (("prefill", prefill_rows), ("decode", decode_rows)):
-            results.append(
-                _run_mlp_mode(
-                    torch=torch,
-                    ttnn=ttnn,
-                    device=device,
-                    mode=mode,
-                    rows=rows,
-                    activation_width=activation_width,
-                    intermediate_width=activation_width * intermediate_multiplier,
-                    runs=runs,
-                    pcc_threshold=pcc_threshold,
+            with _phase(f"{mode} tensor-parallel MLP"):
+                results.append(
+                    _run_mlp_mode(
+                        torch=torch,
+                        ttnn=ttnn,
+                        device=context.device,
+                        is_mesh=context.is_mesh,
+                        tensor_parallel_degree=context.tensor_parallel_degree,
+                        mesh_shape=context.mesh_shape,
+                        mode=mode,
+                        rows=rows,
+                        activation_width=activation_width,
+                        intermediate_width=activation_width * intermediate_multiplier,
+                        runs=runs,
+                        pcc_threshold=pcc_threshold,
+                    )
                 )
-            )
         return results
     finally:
-        if device is not None:
+        if context is not None:
             try:
-                ttnn.close_device(device)
+                if context.is_mesh:
+                    ttnn.close_mesh_device(context.device)
+                else:
+                    ttnn.close_device(context.device)
             except Exception as exc:
-                raise CheckError(f"ttnn.close_device failed: {type(exc).__name__}: {exc}") from exc
+                raise CheckError(f"ttnn device close failed: {type(exc).__name__}: {exc}") from exc
+
+
+def _open_ttnn_device_context(ttnn: Any, *, device_id: int) -> TtnnDeviceContext:
+    device_count = _available_ttnn_devices(ttnn)
+    if device_id != 0 or device_count <= 1:
+        device = ttnn.open_device(device_id=device_id, trace_region_size=0)
+        return TtnnDeviceContext(device=device, tensor_parallel_degree=1, is_mesh=False, mesh_shape=None)
+
+    _enable_1d_fabric(ttnn)
+    mesh_shape = (1, device_count)
+    device = ttnn.open_mesh_device(
+        mesh_shape=ttnn.MeshShape(*mesh_shape),
+        physical_device_ids=list(range(device_count)),
+        trace_region_size=0,
+    )
+    return TtnnDeviceContext(device=device, tensor_parallel_degree=device_count, is_mesh=True, mesh_shape=mesh_shape)
+
+
+def _available_ttnn_devices(ttnn: Any) -> int:
+    errors = []
+    for name in ("get_num_devices", "GetNumAvailableDevices"):
+        query = getattr(ttnn, name, None)
+        if query is None:
+            continue
+        try:
+            count = int(query())
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        if count < 1:
+            raise CheckError(f"{name} reported no available TTNN devices")
+        return count
+    if errors:
+        raise CheckError("failed to query TTNN device count: " + "; ".join(errors))
+    return 1
+
+
+def _enable_1d_fabric(ttnn: Any) -> None:
+    try:
+        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+    except Exception as exc:
+        raise CheckError(f"failed to enable TTNN fabric for tensor-parallel CCLs: {type(exc).__name__}: {exc}") from exc
 
 
 def _run_mlp_mode(
@@ -457,6 +650,9 @@ def _run_mlp_mode(
     torch: Any,
     ttnn: Any,
     device: Any,
+    is_mesh: bool,
+    tensor_parallel_degree: int,
+    mesh_shape: tuple[int, int] | None,
     mode: str,
     rows: int,
     activation_width: int,
@@ -465,28 +661,78 @@ def _run_mlp_mode(
     pcc_threshold: float,
 ) -> dict[str, Any]:
     shape = (1, 1, rows, activation_width)
+    global_intermediate_width = intermediate_width * tensor_parallel_degree
     x = (torch.randn(shape, dtype=torch.float32) * 0.5).to(torch.bfloat16)
-    w1 = torch.randn((activation_width, intermediate_width), dtype=torch.float32) / math.sqrt(activation_width)
-    w3 = torch.randn((activation_width, intermediate_width), dtype=torch.float32) / math.sqrt(activation_width)
-    w2 = torch.randn((intermediate_width, activation_width), dtype=torch.float32) / math.sqrt(intermediate_width)
+    w1 = torch.randn((activation_width, global_intermediate_width), dtype=torch.float32) / math.sqrt(activation_width)
+    w3 = torch.randn((activation_width, global_intermediate_width), dtype=torch.float32) / math.sqrt(activation_width)
+    w2 = torch.randn((global_intermediate_width, activation_width), dtype=torch.float32) / math.sqrt(
+        global_intermediate_width
+    )
 
-    tt_x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-    tt_w1 = ttnn.from_torch(w1, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
-    tt_w3 = ttnn.from_torch(w3, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
-    tt_w2 = ttnn.from_torch(w2, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+    if is_mesh:
+        tt_x = ttnn.from_torch(
+            x,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+        )
+        tt_w1 = ttnn.from_torch(
+            w1,
+            dtype=ttnn.bfloat8_b,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=1),
+        )
+        tt_w3 = ttnn.from_torch(
+            w3,
+            dtype=ttnn.bfloat8_b,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=1),
+        )
+        tt_w2 = ttnn.from_torch(
+            w2,
+            dtype=ttnn.bfloat8_b,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=ttnn.ShardTensorToMesh(device, dim=0),
+        )
+        weight_composers = (
+            ttnn.ConcatMeshToTensor(device, dim=1),
+            ttnn.ConcatMeshToTensor(device, dim=1),
+            ttnn.ConcatMeshToTensor(device, dim=0),
+        )
+    else:
+        tt_x = ttnn.from_torch(x, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        tt_w1 = ttnn.from_torch(w1, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+        tt_w3 = ttnn.from_torch(w3, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+        tt_w2 = ttnn.from_torch(w2, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+        weight_composers = (None, None, None)
 
     try:
-        qw1 = ttnn.to_torch(tt_w1).to(torch.float32)
-        qw3 = ttnn.to_torch(tt_w3).to(torch.float32)
-        qw2 = ttnn.to_torch(tt_w2).to(torch.float32)
-        reference = torch.matmul(torch.nn.functional.silu(torch.matmul(x.to(torch.float32), qw1)) * torch.matmul(x.to(torch.float32), qw3), qw2)
+        qw1 = _to_torch_tensor(ttnn, tt_w1, mesh_composer=weight_composers[0]).to(torch.float32)
+        qw3 = _to_torch_tensor(ttnn, tt_w3, mesh_composer=weight_composers[1]).to(torch.float32)
+        qw2 = _to_torch_tensor(ttnn, tt_w2, mesh_composer=weight_composers[2]).to(torch.float32)
+        reference = torch.matmul(
+            torch.nn.functional.silu(torch.matmul(x.to(torch.float32), qw1)) * torch.matmul(x.to(torch.float32), qw3),
+            qw2,
+        )
 
         mode_start = time.perf_counter()
         pcc_values = []
 
         warmup_start = time.perf_counter()
-        warmup_output, _ = _ttnn_mlp_forward(ttnn, tt_x, tt_w1, tt_w3, tt_w2)
-        warmup_torch = ttnn.to_torch(warmup_output).to(torch.float32)
+        warmup_output, _ = _ttnn_mlp_forward(
+            ttnn,
+            tt_x,
+            tt_w1,
+            tt_w3,
+            tt_w2,
+            tensor_parallel_degree=tensor_parallel_degree,
+            ccl_cluster_axis=1,
+        )
+        warmup_torch = _to_torch_replicated(ttnn, torch, warmup_output, tensor_parallel_degree).to(torch.float32)
         _deallocate(ttnn, warmup_output)
         warmup_elapsed = time.perf_counter() - warmup_start
         first_output = warmup_torch
@@ -500,26 +746,46 @@ def _run_mlp_mode(
             capture_start = time.perf_counter()
             trace_id = ttnn.begin_trace_capture(device, cq_id=0)
             trace_output, trace_intermediates = _ttnn_mlp_forward(
-                ttnn, tt_x, tt_w1, tt_w3, tt_w2, keep_intermediates=True
+                ttnn,
+                tt_x,
+                tt_w1,
+                tt_w3,
+                tt_w2,
+                tensor_parallel_degree=tensor_parallel_degree,
+                ccl_cluster_axis=1,
+                keep_intermediates=True,
             )
             ttnn.end_trace_capture(device, trace_id, cq_id=0)
             capture_elapsed = time.perf_counter() - capture_start
             _synchronize_device(ttnn, device)
 
-            capture_torch = ttnn.to_torch(trace_output).to(torch.float32)
+            capture_torch = _to_torch_replicated(ttnn, torch, trace_output, tensor_parallel_degree).to(torch.float32)
             pcc_values.append(
                 _validate_mlp_output(torch, reference, capture_torch, pcc_threshold, mode, "capture", first_output)
             )
 
+            _emit_progress("bar_start", label=f"{mode} mlp", total=runs)
             replay_start = time.perf_counter()
-            for run_index in range(runs):
-                ttnn.execute_trace(device, trace_id, cq_id=0, blocking=True)
-                output_torch = ttnn.to_torch(trace_output).to(torch.float32)
-                pcc_values.append(
-                    _validate_mlp_output(
-                        torch, reference, output_torch, pcc_threshold, mode, f"trace replay {run_index}", first_output
+            try:
+                for run_index in range(runs):
+                    ttnn.execute_trace(device, trace_id, cq_id=0, blocking=True)
+                    output_torch = _to_torch_replicated(ttnn, torch, trace_output, tensor_parallel_degree).to(
+                        torch.float32
                     )
-                )
+                    pcc_values.append(
+                        _validate_mlp_output(
+                            torch,
+                            reference,
+                            output_torch,
+                            pcc_threshold,
+                            mode,
+                            f"trace replay {run_index}",
+                            first_output,
+                        )
+                    )
+                    _emit_progress("bar_update", advance=1)
+            finally:
+                _emit_progress("bar_done", label=f"{mode} mlp")
             replay_elapsed = time.perf_counter() - replay_start
         finally:
             if trace_id is not None:
@@ -534,8 +800,12 @@ def _run_mlp_mode(
         return {
             "mode": mode,
             "shape": list(shape),
+            "global_intermediate_width": global_intermediate_width,
             "runs": runs,
             "execution": "trace",
+            "tensor_parallel_degree": tensor_parallel_degree,
+            "mesh_shape": list(mesh_shape) if mesh_shape is not None else None,
+            "ccl": "all_reduce" if tensor_parallel_degree > 1 else "none",
             "warmup_runs": 1,
             "captured_runs": 1,
             "pcc": pcc_values[0],
@@ -554,20 +824,58 @@ def _run_mlp_mode(
 
 
 def _ttnn_mlp_forward(
-    ttnn: Any, x: Any, w1: Any, w3: Any, w2: Any, *, keep_intermediates: bool = False
+    ttnn: Any,
+    x: Any,
+    w1: Any,
+    w3: Any,
+    w2: Any,
+    *,
+    tensor_parallel_degree: int,
+    ccl_cluster_axis: int,
+    keep_intermediates: bool = False,
 ) -> tuple[Any, tuple[Any, ...]]:
     w1_out = ttnn.linear(x, w1, dtype=ttnn.bfloat16)
     w3_out = ttnn.linear(x, w3, dtype=ttnn.bfloat16)
     activated = ttnn.silu(w1_out)
     hidden = ttnn.mul(activated, w3_out, dtype=ttnn.bfloat16)
-    output = ttnn.linear(hidden, w2, dtype=ttnn.bfloat16)
+    partial_output = ttnn.linear(hidden, w2, dtype=ttnn.bfloat16)
+    output = (
+        ttnn.all_reduce(partial_output, cluster_axis=ccl_cluster_axis, topology=ttnn.Topology.Linear)
+        if tensor_parallel_degree > 1
+        else partial_output
+    )
 
     intermediates = (hidden, activated, w3_out, w1_out)
+    if output is not partial_output:
+        intermediates = (partial_output, *intermediates)
     if keep_intermediates:
         return output, intermediates
     for tensor in intermediates:
         _deallocate(ttnn, tensor)
     return output, ()
+
+
+def _to_torch_tensor(ttnn: Any, tensor: Any, *, mesh_composer: Any | None = None) -> Any:
+    if mesh_composer is None:
+        return ttnn.to_torch(tensor)
+    return ttnn.to_torch(tensor, mesh_composer=mesh_composer)
+
+
+def _to_torch_replicated(ttnn: Any, torch: Any, tensor: Any, tensor_parallel_degree: int) -> Any:
+    if tensor_parallel_degree <= 1:
+        return ttnn.to_torch(tensor)
+
+    shards = [ttnn.to_torch(device_tensor) for device_tensor in ttnn.get_device_tensors(tensor)]
+    first = shards[0]
+    for index, shard in enumerate(shards[1:], start=1):
+        if not torch.equal(first, shard):
+            max_abs = torch.max(torch.abs(first.to(torch.float32) - shard.to(torch.float32))).item()
+            differing = torch.count_nonzero(first != shard).item()
+            raise CheckError(
+                f"tensor-parallel all-reduce output differs on device shard {index} "
+                f"({differing} elements differ, max_abs_diff={max_abs:.8g})"
+            )
+    return first
 
 
 def _validate_mlp_output(
@@ -634,21 +942,34 @@ def _pearson_corrcoef(torch: Any, expected: Any, actual: Any) -> float:
 
 
 def _format_human_result(result: dict[str, Any]) -> str:
-    system = result["system"]
     mlp_by_mode = {item["mode"]: item for item in result["mlp"]}
     prefill = mlp_by_mode["prefill"]
     decode = mlp_by_mode["decode"]
-    runs = max(item["runs"] for item in result["mlp"])
+    elapsed = result.get("elapsed_s")
+    elapsed_text = f" in {elapsed:.1f} seconds" if isinstance(elapsed, (int, float)) else ""
+    return (
+        f"tt-check: passed{elapsed_text} | "
+        f"prefill pcc {prefill['pcc']:.8f} | decode pcc {decode['pcc']:.8f}"
+    )
+
+
+def _format_runtime_system_summary(system: dict[str, Any], mesh_shape: tuple[int, int] | None) -> str:
     cards = system["card_count"]
-    lines = [
-        "tt-check passed",
-        "",
-        "reset   ok",
-        f"system  {_join_short(system['architecture'])} | {_join_short(system['device_series'])} | {cards} {_plural(cards, 'card')} | {_short_topology(system['mesh_topology'])}",
-        f"mlp     prefill pcc {prefill['pcc']:.8f} | decode pcc {decode['pcc']:.8f} | trace x{runs}",
-        "ready.",
-    ]
-    return "\n".join(lines)
+    series = _join_short(system["device_series"])
+    card_text = f"{cards}x {series}" if series != "unknown" else f"{cards} {_plural(cards, 'card')}"
+    arch_text = _join_short(system["architecture"])
+    topology_text = _format_mesh_shape(mesh_shape) or _short_topology(system["mesh_topology"])
+    return f"{topology_text} ({card_text} | {arch_text})"
+
+
+def _format_mesh_shape(mesh_shape: Any) -> str:
+    if not mesh_shape:
+        return ""
+    try:
+        rows, columns = mesh_shape
+    except (TypeError, ValueError):
+        return ""
+    return f"{rows}x{columns} mesh"
 
 
 def _join_short(values: list[str]) -> str:

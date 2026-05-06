@@ -47,15 +47,62 @@ class CliHelpersTest(unittest.TestCase):
                 "mesh_topology": "single-card/non-mesh inferred from card count",
             },
             "mlp": [
-                {"mode": "prefill", "runs": 100, "pcc": 0.9998160161456406},
-                {"mode": "decode", "runs": 100, "pcc": 0.999871423156057},
+                {
+                    "mode": "prefill",
+                    "runs": 100,
+                    "pcc": 0.9998160161456406,
+                    "tensor_parallel_degree": 2,
+                    "mesh_shape": [1, 2],
+                    "ccl": "all_reduce",
+                },
+                {
+                    "mode": "decode",
+                    "runs": 100,
+                    "pcc": 0.999871423156057,
+                    "tensor_parallel_degree": 2,
+                    "mesh_shape": [1, 2],
+                    "ccl": "all_reduce",
+                },
             ],
         }
 
         text = cli._format_human_result(result)
 
-        self.assertIn("trace x100", text)
-        self.assertIn("ready.", text)
+        self.assertEqual(
+            text,
+            "tt-check: passed | prefill pcc 0.99981602 | decode pcc 0.99987142",
+        )
+        self.assertTrue(text.startswith("tt-check: passed"))
+
+    def test_runtime_system_summary_mentions_mesh_shape(self) -> None:
+        system = {
+            "architecture": ["blackhole"],
+            "device_series": ["p300a"],
+            "card_count": 1,
+            "mesh_topology": "single-card/non-mesh inferred from card count",
+        }
+
+        text = cli._format_runtime_system_summary(system, (1, 2))
+
+        self.assertEqual(text, "1x2 mesh (1x p300a | blackhole)")
+
+    def test_format_failure_keeps_error_context(self) -> None:
+        stderr = "\n".join(
+            [
+                "debug noise",
+                "ERROR: running TTNN MLP readiness check failed: prefill tensor-parallel MLP failed: RuntimeError: boom",
+                "",
+                "Traceback:",
+                "  File \"cli.py\", line 1, in _run_mlp_mode",
+                "RuntimeError: boom",
+            ]
+        )
+
+        text = cli._format_failure("", stderr)
+
+        self.assertIn("prefill tensor-parallel MLP failed", text)
+        self.assertIn("Traceback:", text)
+        self.assertIn("RuntimeError: boom", text)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tt-check"
+version = "0.1.0"
+description = "Small TTNN readiness check for Tenstorrent systems"
+readme = "README.md"
+requires-python = ">=3.10,<3.13,!=3.11.*"
+license = "Apache-2.0"
+authors = [
+  { name = "Tenstorrent" },
+]
+keywords = ["tenstorrent", "ttnn", "tt-smi", "readiness", "hardware"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = [
+  "torch; platform_system == 'Linux'",
+  "tt-smi>=3.1.1; platform_system == 'Linux'",
+  "ttnn; platform_system == 'Linux'",
+]
+
+[project.urls]
+Homepage = "https://github.com/yieldthought/tt-check"
+Repository = "https://github.com/yieldthought/tt-check"
+Issues = "https://github.com/yieldthought/tt-check/issues"
+
+[project.scripts]
+tt-check = "tt_check.cli:main"
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tt_check"]

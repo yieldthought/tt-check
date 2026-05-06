@@ -86,6 +86,44 @@ class CliHelpersTest(unittest.TestCase):
 
         self.assertEqual(text, "1x2 mesh (1x p300a | blackhole)")
 
+    def test_multi_device_open_lets_ttnn_choose_placement(self) -> None:
+        class FakeMeshShape:
+            def __init__(self, *shape: int) -> None:
+                self.shape = shape
+
+        class FakeTtnn:
+            MeshShape = FakeMeshShape
+
+            class FabricConfig:
+                FABRIC_1D = "fabric-1d"
+
+            def __init__(self) -> None:
+                self.fabric_config = None
+                self.open_mesh_kwargs = None
+
+            def get_num_devices(self) -> int:
+                return 4
+
+            def set_fabric_config(self, fabric_config: str) -> None:
+                self.fabric_config = fabric_config
+
+            def open_mesh_device(self, **kwargs: object) -> object:
+                self.open_mesh_kwargs = kwargs
+                return object()
+
+        fake_ttnn = FakeTtnn()
+
+        context = cli._open_ttnn_device_context(fake_ttnn, device_id=0)
+
+        self.assertTrue(context.is_mesh)
+        self.assertEqual(context.mesh_shape, (1, 4))
+        self.assertEqual(context.tensor_parallel_degree, 4)
+        self.assertEqual(fake_ttnn.fabric_config, fake_ttnn.FabricConfig.FABRIC_1D)
+        self.assertIsNotNone(fake_ttnn.open_mesh_kwargs)
+        self.assertEqual(fake_ttnn.open_mesh_kwargs["mesh_shape"].shape, (1, 4))
+        self.assertEqual(fake_ttnn.open_mesh_kwargs["trace_region_size"], 0)
+        self.assertNotIn("physical_device_ids", fake_ttnn.open_mesh_kwargs)
+
     def test_format_failure_keeps_error_context(self) -> None:
         stderr = "\n".join(
             [

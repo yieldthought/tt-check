@@ -613,7 +613,6 @@ def _open_ttnn_device_context(ttnn: Any, *, device_id: int) -> TtnnDeviceContext
     mesh_shape = (1, device_count)
     device = ttnn.open_mesh_device(
         mesh_shape=ttnn.MeshShape(*mesh_shape),
-        physical_device_ids=list(range(device_count)),
         trace_region_size=0,
     )
     return TtnnDeviceContext(device=device, tensor_parallel_degree=device_count, is_mesh=True, mesh_shape=mesh_shape)

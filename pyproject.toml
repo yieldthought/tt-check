@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tt-check"
-version = "0.1.1"
+version = "0.1.2"
 description = "Small TTNN readiness check for Tenstorrent systems"
 readme = "README.md"
 requires-python = ">=3.10,<3.13,!=3.11.*"

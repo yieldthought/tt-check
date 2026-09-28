@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import unittest
+from unittest.mock import Mock, patch
 
 from tt_check import cli
 
@@ -10,6 +13,7 @@ class CliHelpersTest(unittest.TestCase):
     def test_validate_runs(self) -> None:
         args = argparse.Namespace(
             runs=0,
+            time_seconds=None,
             pcc_threshold=0.99,
             activation_width_per_device=1024,
             prefill_rows=1024,
@@ -19,6 +23,75 @@ class CliHelpersTest(unittest.TestCase):
 
         with self.assertRaisesRegex(cli.CheckError, "--runs must be >= 1"):
             cli._validate_args(args)
+
+    def test_run_limits(self) -> None:
+        default = cli._parse_args([])
+        self.assertEqual(default.runs, 100)
+        self.assertIsNone(default.time_seconds)
+        timed = cli._parse_args(["--time", "0.25"])
+        cli._validate_args(timed)
+        self.assertIsNone(timed.runs)
+        self.assertEqual(timed.time_seconds, 0.25)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli._parse_args(["--runs", "2", "--time", "1"])
+
+    def test_invalid_time(self) -> None:
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaisesRegex(cli.CheckError, "--time"):
+                cli._validate_args(cli._parse_args(["--time", value]))
+
+    def test_rows_validation(self) -> None:
+        for mode in ("prefill", "decode"):
+            cli._validate_args(cli._parse_args([f"--{mode}-rows", "0"]))
+            with self.assertRaisesRegex(cli.CheckError, "must be >= 0"):
+                cli._validate_args(cli._parse_args([f"--{mode}-rows", "-1"]))
+        with self.assertRaisesRegex(cli.CheckError, "at least one"):
+            cli._validate_args(cli._parse_args(["--prefill-rows", "0", "--decode-rows", "0"]))
+
+    def test_skipped_modes_are_not_run(self) -> None:
+        for prefill_rows, decode_rows, modes in ((1024, 0, ["prefill"]), (0, 1, ["decode"]), (1024, 1, ["prefill", "decode"])):
+            with self.subTest(modes=modes):
+                fake_ttnn = Mock()
+                context = cli.TtnnDeviceContext(object(), 1, False, None)
+                with (
+                    patch.dict("sys.modules", {"torch": Mock(), "ttnn": fake_ttnn}),
+                    patch.object(cli, "_open_ttnn_device_context", return_value=context),
+                    patch.object(cli, "_run_mlp_mode", side_effect=lambda **kw: {"mode": kw["mode"]}) as run,
+                ):
+                    results = cli.run_ttnn_mlp_check(
+                        device_id=0, runs=None, time_seconds=2.5, pcc_threshold=0.99,
+                        activation_width=1024, prefill_rows=prefill_rows, decode_rows=decode_rows,
+                        intermediate_multiplier=4, seed=0,
+                    )
+                self.assertEqual([r["mode"] for r in results], modes)
+                self.assertTrue(all(c.kwargs["time_seconds"] == 2.5 for c in run.call_args_list))
+                fake_ttnn.close_device.assert_called_once_with(context.device)
+
+    def test_fixed_replay_count_does_not_use_deadline(self) -> None:
+        with patch.object(cli.time, "perf_counter", side_effect=AssertionError("unexpected clock read")):
+            self.assertEqual(list(cli._replay_indices(3, None, 0)), [0, 1, 2])
+
+    def test_timed_replays_stop_at_deadline(self) -> None:
+        with patch.object(cli.time, "perf_counter", side_effect=[100.1, 100.9, 101.0]):
+            self.assertEqual(list(cli._replay_indices(None, 1, 100)), [0, 1, 2])
+
+    def test_short_time_still_completes_one_replay(self) -> None:
+        with patch.object(cli.time, "perf_counter", return_value=102):
+            self.assertEqual(list(cli._replay_indices(None, 0.001, 100)), [0])
+
+    def test_timed_progress_preserves_fractional_seconds(self) -> None:
+        with patch.object(cli._ProgressRenderer, "_load_tqdm") as load:
+            renderer = cli._ProgressRenderer(enabled=True)
+            renderer.handle({"event": "bar_start", "label": "prefill mlp", "total": 0.5, "unit": "s"})
+            renderer.handle({"event": "bar_update", "advance": 0.25})
+            self.assertEqual(load.return_value.call_args.kwargs["total"], 0.5)
+            self.assertEqual(load.return_value.call_args.kwargs["unit"], "s")
+            load.return_value.return_value.update.assert_called_once_with(0.25)
+
+    def test_human_result_with_only_one_mode(self) -> None:
+        for mode in ("prefill", "decode"):
+            result = {"elapsed_s": 2.5, "mlp": [{"mode": mode, "pcc": 0.9999}]}
+            self.assertEqual(cli._format_human_result(result), f"tt-check: passed in 2.5 seconds | {mode} pcc 0.99990000")
 
     def test_system_summary_from_blackhole_snapshot(self) -> None:
         snapshot = {

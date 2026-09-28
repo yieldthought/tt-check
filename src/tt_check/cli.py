@@ -153,7 +153,12 @@ def _main_parent(raw_argv: list[str], args: argparse.Namespace) -> int:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a small TTNN readiness check.")
     parser.add_argument("--device-id", type=int, default=0, help="TTNN device id to open.")
-    parser.add_argument("--runs", type=int, default=100, help="Number of identical MLP runs per mode.")
+    limit = parser.add_mutually_exclusive_group()
+    limit.add_argument("--runs", type=int, help="Number of identical MLP runs per enabled mode (default: 100).")
+    limit.add_argument(
+        "--time", type=float, dest="time_seconds", metavar="SECONDS",
+        help="Replay each enabled mode for this many seconds, excluding setup and warmup.",
+    )
     parser.add_argument("--pcc-threshold", type=float, default=0.99, help="Minimum PCC against PyTorch reference.")
     parser.add_argument(
         "--activation-width-per-device",
@@ -161,8 +166,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=1024,
         help="Activation shard width used for the simulated tensor-parallel MLP.",
     )
-    parser.add_argument("--prefill-rows", type=int, default=1024, help="Input rows for prefill mode.")
-    parser.add_argument("--decode-rows", type=int, default=1, help="Input rows for decode mode.")
+    parser.add_argument("--prefill-rows", type=int, default=1024, help="Input rows for prefill mode; 0 skips it.")
+    parser.add_argument("--decode-rows", type=int, default=1, help="Input rows for decode mode; 0 skips it.")
     parser.add_argument(
         "--intermediate-multiplier",
         type=int,
@@ -173,7 +178,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--tt-smi-timeout", type=float, default=120.0, help="Timeout for each tt-smi command.")
     parser.add_argument("--json", action="store_true", help="Print final result as JSON.")
     parser.add_argument("--_worker-json", dest="_worker_json", default=None, help=argparse.SUPPRESS)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.runs is None and args.time_seconds is None:
+        args.runs = 100
+    return args
 
 
 def run_check(args: argparse.Namespace) -> dict[str, Any]:
@@ -193,6 +201,7 @@ def run_check(args: argparse.Namespace) -> dict[str, Any]:
             system_info=system_info,
             device_id=args.device_id,
             runs=args.runs,
+            time_seconds=args.time_seconds,
             pcc_threshold=args.pcc_threshold,
             activation_width=args.activation_width_per_device,
             prefill_rows=args.prefill_rows,
@@ -210,11 +219,20 @@ def run_check(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if args.runs < 1:
+    if args.runs is not None and args.time_seconds is not None:
+        raise CheckError("--runs and --time cannot be used together")
+    if args.runs is not None and args.runs < 1:
         raise CheckError("--runs must be >= 1")
+    if args.time_seconds is not None and (not math.isfinite(args.time_seconds) or args.time_seconds <= 0):
+        raise CheckError("--time must be a finite number > 0")
     if not 0.0 <= args.pcc_threshold <= 1.0:
         raise CheckError("--pcc-threshold must be between 0 and 1")
-    for name in ("activation_width_per_device", "prefill_rows", "decode_rows", "intermediate_multiplier"):
+    for name in ("prefill_rows", "decode_rows"):
+        if getattr(args, name) < 0:
+            raise CheckError(f"--{name.replace('_', '-')} must be >= 0")
+    if args.prefill_rows == 0 and args.decode_rows == 0:
+        raise CheckError("at least one of --prefill-rows or --decode-rows must be > 0")
+    for name in ("activation_width_per_device", "intermediate_multiplier"):
         if getattr(args, name) < 1:
             raise CheckError(f"--{name.replace('_', '-')} must be >= 1")
     if args.activation_width_per_device % 32 != 0:
@@ -267,9 +285,9 @@ class _ProgressRenderer:
         elif event_type == "message":
             self.write(str(event.get("text", "")))
         elif event_type == "bar_start":
-            self.start_bar(str(event.get("label", "work")), int(event.get("total", 0)))
+            self.start_bar(str(event.get("label", "work")), event.get("total", 0), str(event.get("unit", "run")))
         elif event_type == "bar_update":
-            self.update_bar(int(event.get("advance", 1)))
+            self.update_bar(event.get("advance", 1))
         elif event_type == "bar_done":
             self.finish_bar(str(event.get("label", self.current_label)))
 
@@ -285,7 +303,7 @@ class _ProgressRenderer:
         else:
             print(f"tt-check: {status}", flush=True)
 
-    def start_bar(self, label: str, total: int) -> None:
+    def start_bar(self, label: str, total: float, unit: str = "run") -> None:
         self.close()
         self.current_label = label
         if self.tqdm is None:
@@ -294,13 +312,14 @@ class _ProgressRenderer:
         self.current_bar = self.tqdm(
             total=total,
             desc=f"tt-check: {label}",
-            unit="run",
+            unit=unit,
+            bar_format="{l_bar}{bar}| [{elapsed}<{remaining}]" if unit == "s" else None,
             dynamic_ncols=True,
             leave=True,
             file=sys.stdout,
         )
 
-    def update_bar(self, advance: int) -> None:
+    def update_bar(self, advance: float) -> None:
         if self.current_bar is not None:
             self.current_bar.update(advance)
 
@@ -551,7 +570,8 @@ def run_ttnn_mlp_check(
     *,
     system_info: dict[str, Any] | None = None,
     device_id: int,
-    runs: int,
+    runs: int | None,
+    time_seconds: float | None = None,
     pcc_threshold: float,
     activation_width: int,
     prefill_rows: int,
@@ -574,6 +594,8 @@ def run_ttnn_mlp_check(
             _emit_progress("message", text=_format_runtime_system_summary(system_info, context.mesh_shape))
         results = []
         for mode, rows in (("prefill", prefill_rows), ("decode", decode_rows)):
+            if rows == 0:
+                continue
             with _phase(f"{mode} tensor-parallel MLP"):
                 results.append(
                     _run_mlp_mode(
@@ -588,6 +610,7 @@ def run_ttnn_mlp_check(
                         activation_width=activation_width,
                         intermediate_width=activation_width * intermediate_multiplier,
                         runs=runs,
+                        time_seconds=time_seconds,
                         pcc_threshold=pcc_threshold,
                     )
                 )
@@ -656,7 +679,8 @@ def _run_mlp_mode(
     rows: int,
     activation_width: int,
     intermediate_width: int,
-    runs: int,
+    runs: int | None,
+    time_seconds: float | None = None,
     pcc_threshold: float,
 ) -> dict[str, Any]:
     shape = (1, 1, rows, activation_width)
@@ -763,10 +787,16 @@ def _run_mlp_mode(
                 _validate_mlp_output(torch, reference, capture_torch, pcc_threshold, mode, "capture", first_output)
             )
 
-            _emit_progress("bar_start", label=f"{mode} mlp", total=runs)
+            _emit_progress(
+                "bar_start", label=f"{mode} mlp",
+                total=time_seconds if time_seconds is not None else runs,
+                unit="s" if time_seconds is not None else "run",
+            )
             replay_start = time.perf_counter()
+            completed_runs = 0
+            progress_seconds = 0.0
             try:
-                for run_index in range(runs):
+                for run_index in _replay_indices(runs, time_seconds, replay_start):
                     ttnn.execute_trace(device, trace_id, cq_id=0, blocking=True)
                     output_torch = _to_torch_replicated(ttnn, torch, trace_output, tensor_parallel_degree).to(
                         torch.float32
@@ -782,7 +812,13 @@ def _run_mlp_mode(
                             first_output,
                         )
                     )
-                    _emit_progress("bar_update", advance=1)
+                    completed_runs += 1
+                    if time_seconds is None:
+                        _emit_progress("bar_update", advance=1)
+                    else:
+                        elapsed = min(time.perf_counter() - replay_start, time_seconds)
+                        _emit_progress("bar_update", advance=elapsed - progress_seconds)
+                        progress_seconds = elapsed
             finally:
                 _emit_progress("bar_done", label=f"{mode} mlp")
             replay_elapsed = time.perf_counter() - replay_start
@@ -800,7 +836,8 @@ def _run_mlp_mode(
             "mode": mode,
             "shape": list(shape),
             "global_intermediate_width": global_intermediate_width,
-            "runs": runs,
+            "runs": completed_runs,
+            "requested_time_s": time_seconds,
             "execution": "trace",
             "tensor_parallel_degree": tensor_parallel_degree,
             "mesh_shape": list(mesh_shape) if mesh_shape is not None else None,
@@ -820,6 +857,19 @@ def _run_mlp_mode(
     finally:
         for tensor in (tt_x, tt_w1, tt_w3, tt_w2):
             _deallocate(ttnn, tensor)
+
+
+def _replay_indices(runs: int | None, time_seconds: float | None, start: float) -> Iterable[int]:
+    """Finish at least one replay, checking the deadline between complete validations."""
+    index = 0
+    while True:
+        if time_seconds is None:
+            if runs is None or index >= runs:
+                return
+        elif index > 0 and time.perf_counter() - start >= time_seconds:
+            return
+        yield index
+        index += 1
 
 
 def _ttnn_mlp_forward(
@@ -941,15 +991,10 @@ def _pearson_corrcoef(torch: Any, expected: Any, actual: Any) -> float:
 
 
 def _format_human_result(result: dict[str, Any]) -> str:
-    mlp_by_mode = {item["mode"]: item for item in result["mlp"]}
-    prefill = mlp_by_mode["prefill"]
-    decode = mlp_by_mode["decode"]
     elapsed = result.get("elapsed_s")
     elapsed_text = f" in {elapsed:.1f} seconds" if isinstance(elapsed, (int, float)) else ""
-    return (
-        f"tt-check: passed{elapsed_text} | "
-        f"prefill pcc {prefill['pcc']:.8f} | decode pcc {decode['pcc']:.8f}"
-    )
+    modes = " | ".join(f"{item['mode']} pcc {item['pcc']:.8f}" for item in result["mlp"])
+    return f"tt-check: passed{elapsed_text} | {modes}"
 
 
 def _format_runtime_system_summary(system: dict[str, Any], mesh_shape: tuple[int, int] | None) -> str:

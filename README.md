@@ -77,3 +77,25 @@ Useful options:
 tt-check --device-id 0 --runs 100 --pcc-threshold 0.99
 tt-check --prefill-rows 1024 --decode-rows 1 --activation-width-per-device 1024
 ```
+
+Set a mode's row count to `0` to skip it. At least one mode must be enabled.
+Use `--time SECONDS` instead of `--runs` to replay each enabled mode for a
+duration. The default remains 100 runs per mode. For a 60-minute prefill-only
+run with 8192 rows:
+
+```bash
+tt-check --prefill-rows 8192 --decode-rows 0 --time 3600
+```
+
+The timer starts after setup, reference calculation, warmup and trace capture.
+It includes replay, output transfer and correctness validation, and stops after
+the first complete replay that reaches the duration. A short duration still
+runs at least one replay. If both modes are enabled, each gets the full duration.
+The progress bar shows elapsed time and estimated time remaining. JSON output
+includes the actual replay count in `runs` and the requested duration in
+`requested_time_s` (`null` for count-based runs).
+
+Every invocation resets the devices with `tt-smi -r`. Use a machine reserved
+for the test. Output is copied to the CPU and checked after every replay, so
+this is a compute and correctness soak test, not a guarantee of continuous
+FPU saturation.
